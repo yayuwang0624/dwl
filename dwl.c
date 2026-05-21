@@ -257,6 +257,7 @@ static void checkidleinhibitor(struct wlr_surface *exclude);
 static void cleanup(void);
 static void cleanupmon(struct wl_listener *listener, void *data);
 static void cleanuplisteners(void);
+static void cyclelayout(const Arg *arg);
 static void closemon(Monitor *m);
 static void commitlayersurfacenotify(struct wl_listener *listener, void *data);
 static void commitnotify(struct wl_listener *listener, void *data);
@@ -308,6 +309,7 @@ static void motionabsolute(struct wl_listener *listener, void *data);
 static void motionnotify(uint32_t time, struct wlr_input_device *device, double sx,
 		double sy, double sx_unaccel, double sy_unaccel);
 static void motionrelative(struct wl_listener *listener, void *data);
+static void movestack(const Arg *arg);
 static void moveresize(const Arg *arg);
 static void outputmgrapply(struct wl_listener *listener, void *data);
 static void outputmgrapplyortest(struct wlr_output_configuration_v1 *config, int test);
@@ -333,6 +335,8 @@ static void setmon(Client *c, Monitor *m, uint32_t newtags);
 static void setpsel(struct wl_listener *listener, void *data);
 static void setsel(struct wl_listener *listener, void *data);
 static void setup(void);
+static void shiftboth(const Arg *arg);
+static void shiftview(const Arg *arg);
 static void spawn(const Arg *arg);
 static void startdrag(struct wl_listener *listener, void *data);
 static void tag(const Arg *arg);
@@ -2603,8 +2607,8 @@ setup(void)
 	 * Xcursor themes to source cursor images from and makes sure that cursor
 	 * images are available at all scale factors on the screen (necessary for
 	 * HiDPI support). Scaled cursors will be loaded with each output. */
-	cursor_mgr = wlr_xcursor_manager_create(NULL, 24);
-	setenv("XCURSOR_SIZE", "24", 1);
+	cursor_mgr = wlr_xcursor_manager_create(NULL, 48);
+	setenv("XCURSOR_SIZE", "48", 1);
 
 	/*
 	 * wlr_cursor *only* displays an image on screen. It does not move around
@@ -3079,6 +3083,86 @@ zoom(const Arg *arg)
 	wl_list_insert(&clients, &sel->link);
 
 	focusclient(sel, 1);
+	arrange(selmon);
+}
+
+void
+cyclelayout(const Arg *arg)
+{
+	int i;
+
+	if (!selmon)
+		return;
+	for (i = 0; i < (int)LENGTH(layouts); i++)
+		if (selmon->lt[selmon->sellt] == &layouts[i])
+			break;
+	i = (i + arg->i + LENGTH(layouts)) % LENGTH(layouts);
+	setlayout(&(Arg){.v = &layouts[i]});
+}
+
+void
+shiftview(const Arg *arg)
+{
+	Arg shifted;
+
+	if (!selmon)
+		return;
+	if (arg->i > 0)
+		shifted.ui = ((selmon->tagset[selmon->seltags] << arg->i)
+			| (selmon->tagset[selmon->seltags] >> (TAGCOUNT - arg->i))) & TAGMASK;
+	else
+		shifted.ui = ((selmon->tagset[selmon->seltags] >> -arg->i)
+			| (selmon->tagset[selmon->seltags] << (TAGCOUNT + arg->i))) & TAGMASK;
+	view(&shifted);
+}
+
+void
+shiftboth(const Arg *arg)
+{
+	Arg shifted;
+	Client *sel;
+
+	if (!selmon || !(sel = focustop(selmon)))
+		return;
+	if (arg->i > 0)
+		shifted.ui = ((selmon->tagset[selmon->seltags] << arg->i)
+			| (selmon->tagset[selmon->seltags] >> (TAGCOUNT - arg->i))) & TAGMASK;
+	else
+		shifted.ui = ((selmon->tagset[selmon->seltags] >> -arg->i)
+			| (selmon->tagset[selmon->seltags] << (TAGCOUNT + arg->i))) & TAGMASK;
+	sel->tags = shifted.ui;
+	view(&shifted);
+}
+
+void
+movestack(const Arg *arg)
+{
+	Client *c = NULL, *sel = focustop(selmon);
+
+	if (!sel || sel->isfloating || sel->isfullscreen)
+		return;
+	if (arg->i > 0) {
+		wl_list_for_each(c, &sel->link, link) {
+			if (&c->link == &clients)
+				continue;
+			if (VISIBLEON(c, selmon) && !c->isfloating)
+				break;
+		}
+	} else {
+		wl_list_for_each_reverse(c, &sel->link, link) {
+			if (&c->link == &clients)
+				continue;
+			if (VISIBLEON(c, selmon) && !c->isfloating)
+				break;
+		}
+	}
+	if (!c || c == sel || &c->link == &clients)
+		return;
+	wl_list_remove(&sel->link);
+	if (arg->i > 0)
+		wl_list_insert(&c->link, &sel->link);
+	else
+		wl_list_insert(c->link.prev, &sel->link);
 	arrange(selmon);
 }
 
