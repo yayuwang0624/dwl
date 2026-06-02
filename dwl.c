@@ -32,6 +32,7 @@
 #include <wlr/types/wlr_idle_inhibit_v1.h>
 #include <wlr/types/wlr_idle_notify_v1.h>
 #include <wlr/types/wlr_input_device.h>
+#include <wlr/types/wlr_foreign_toplevel_management_v1.h>
 #include <wlr/types/wlr_keyboard.h>
 #include <wlr/types/wlr_keyboard_group.h>
 #include <wlr/types/wlr_layer_shell_v1.h>
@@ -71,6 +72,7 @@
 #include <xcb/xcb_icccm.h>
 #endif
 
+#include "dwl-ipc-unstable-v2-protocol.h"
 #include "xdg-shell-protocol.h"
 #include "util.h"
 
@@ -139,11 +141,22 @@ typedef struct {
 	struct wl_listener configure;
 	struct wl_listener set_hints;
 #endif
+	struct wlr_foreign_toplevel_handle_v1 *foreign_toplevel;
+	struct wl_listener foreign_activate;
+	struct wl_listener foreign_fullscreen;
+	struct wl_listener foreign_close;
+	int foreign_visible; /* whether the toplevel has entered its mon's output (taskbar = current tag only) */
 	unsigned int bw;
 	uint32_t tags;
 	int isfloating, isurgent, isfullscreen;
 	uint32_t resize; /* configure serial of a pending resize */
 } Client;
+
+typedef struct {
+	struct wl_resource *resource;
+	Monitor *mon;
+	struct wl_list link;
+} DwlIpcOutput;
 
 typedef struct {
 	uint32_t mod;
@@ -189,6 +202,7 @@ typedef struct {
 
 struct Monitor {
 	struct wl_list link;
+	struct wl_list dwl_ipc_outputs;
 	struct wlr_output *wlr_output;
 	struct wlr_scene_output *scene_output;
 	struct wlr_scene_rect *fullscreen_bg; /* See createmon() for info */
@@ -287,10 +301,29 @@ static void destroypointerconstraint(struct wl_listener *listener, void *data);
 static void destroysessionlock(struct wl_listener *listener, void *data);
 static void destroykeyboardgroup(struct wl_listener *listener, void *data);
 static Monitor *dirtomon(enum wlr_direction dir);
+static void dwl_ipc_manager_bind(struct wl_client *client, void *data,
+		uint32_t version, uint32_t id);
+static void dwl_ipc_manager_destroy(struct wl_resource *resource);
+static void dwl_ipc_manager_get_output(struct wl_client *client,
+		struct wl_resource *resource, uint32_t id, struct wl_resource *output);
+static void dwl_ipc_manager_release(struct wl_client *client, struct wl_resource *resource);
+static void dwl_ipc_output_destroy(struct wl_resource *resource);
+static void dwl_ipc_output_printstatus(Monitor *monitor);
+static void dwl_ipc_output_printstatus_to(DwlIpcOutput *ipc_output);
+static void dwl_ipc_output_release(struct wl_client *client, struct wl_resource *resource);
+static void dwl_ipc_output_set_client_tags(struct wl_client *client,
+		struct wl_resource *resource, uint32_t and_tags, uint32_t xor_tags);
+static void dwl_ipc_output_set_layout(struct wl_client *client,
+		struct wl_resource *resource, uint32_t index);
+static void dwl_ipc_output_set_tags(struct wl_client *client,
+		struct wl_resource *resource, uint32_t tagmask, uint32_t toggle_tagset);
 static void focusclient(Client *c, int lift);
 static void focusmon(const Arg *arg);
 static void focusstack(const Arg *arg);
 static Client *focustop(Monitor *m);
+static void foreigntoplevelactivate(struct wl_listener *listener, void *data);
+static void foreigntoplevelclose(struct wl_listener *listener, void *data);
+static void foreigntoplevelfullscreen(struct wl_listener *listener, void *data);
 static void fullscreennotify(struct wl_listener *listener, void *data);
 static void gpureset(struct wl_listener *listener, void *data);
 static void handlesig(int signo);
@@ -390,6 +423,7 @@ static struct wlr_virtual_keyboard_manager_v1 *virtual_keyboard_mgr;
 static struct wlr_virtual_pointer_manager_v1 *virtual_pointer_mgr;
 static struct wlr_cursor_shape_manager_v1 *cursor_shape_mgr;
 static struct wlr_output_power_manager_v1 *power_mgr;
+static struct wlr_foreign_toplevel_manager_v1 *foreign_toplevel_mgr;
 
 static struct wlr_pointer_constraints_v1 *pointer_constraints;
 static struct wlr_relative_pointer_manager_v1 *relative_pointer_mgr;
@@ -521,8 +555,19 @@ arrange(Monitor *m)
 
 	wl_list_for_each(c, &clients, link) {
 		if (c->mon == m) {
-			wlr_scene_node_set_enabled(&c->scene->node, VISIBLEON(c, m));
-			client_set_suspended(c, !VISIBLEON(c, m));
+			int vis = VISIBLEON(c, m);
+			wlr_scene_node_set_enabled(&c->scene->node, vis);
+			client_set_suspended(c, !vis);
+			/* Drive the foreign-toplevel output enter/leave by tag
+			 * visibility so wlr/taskbar (all-outputs:false) lists only
+			 * windows on the current tag. Track state to avoid resending. */
+			if (c->foreign_toplevel && c->foreign_visible != vis) {
+				if (vis)
+					wlr_foreign_toplevel_handle_v1_output_enter(c->foreign_toplevel, m->wlr_output);
+				else
+					wlr_foreign_toplevel_handle_v1_output_leave(c->foreign_toplevel, m->wlr_output);
+				c->foreign_visible = vis;
+			}
 		}
 	}
 
@@ -736,6 +781,7 @@ cleanupmon(struct wl_listener *listener, void *data)
 {
 	Monitor *m = wl_container_of(listener, m, destroy);
 	LayerSurface *l, *tmp;
+	DwlIpcOutput *ipc_output, *ipc_output_tmp;
 	size_t i;
 
 	/* m->layers[i] are intentionally not unlinked */
@@ -743,6 +789,9 @@ cleanupmon(struct wl_listener *listener, void *data)
 		wl_list_for_each_safe(l, tmp, &m->layers[i], link)
 			wlr_layer_surface_v1_destroy(l->layer_surface);
 	}
+
+	wl_list_for_each_safe(ipc_output, ipc_output_tmp, &m->dwl_ipc_outputs, link)
+		wl_resource_destroy(ipc_output->resource);
 
 	wl_list_remove(&m->destroy.link);
 	wl_list_remove(&m->frame.link);
@@ -1059,6 +1108,8 @@ createmon(struct wl_listener *listener, void *data)
 
 	m = wlr_output->data = ecalloc(1, sizeof(*m));
 	m->wlr_output = wlr_output;
+
+	wl_list_init(&m->dwl_ipc_outputs);
 
 	for (i = 0; i < LENGTH(m->layers); i++)
 		wl_list_init(&m->layers[i]);
@@ -1408,6 +1459,36 @@ dirtomon(enum wlr_direction dir)
 }
 
 void
+foreigntoplevelactivate(struct wl_listener *listener, void *data)
+{
+	/* Taskbar requested focus: select the client's monitor, show its tag(s),
+	 * and focus it. */
+	Client *c = wl_container_of(listener, c, foreign_activate);
+	if (!c->mon)
+		return;
+	selmon = c->mon;
+	c->mon->tagset[c->mon->seltags] = c->tags;
+	focusclient(c, 1);
+	arrange(c->mon);
+	printstatus();
+}
+
+void
+foreigntoplevelclose(struct wl_listener *listener, void *data)
+{
+	Client *c = wl_container_of(listener, c, foreign_close);
+	client_send_close(c);
+}
+
+void
+foreigntoplevelfullscreen(struct wl_listener *listener, void *data)
+{
+	struct wlr_foreign_toplevel_handle_v1_fullscreen_event *event = data;
+	Client *c = wl_container_of(listener, c, foreign_fullscreen);
+	setfullscreen(c, event->fullscreen);
+}
+
+void
 focusclient(Client *c, int lift)
 {
 	struct wlr_surface *old = seat->keyboard_state.focused_surface;
@@ -1437,6 +1518,8 @@ focusclient(Client *c, int lift)
 		wl_list_insert(&fstack, &c->flink);
 		selmon = c->mon;
 		c->isurgent = 0;
+		if (c->foreign_toplevel)
+			wlr_foreign_toplevel_handle_v1_set_activated(c->foreign_toplevel, 1);
 
 		/* Don't change border color if there is an exclusive focus or we are
 		 * handling a drag operation */
@@ -1461,6 +1544,8 @@ focusclient(Client *c, int lift)
 			client_set_border_color(old_c, bordercolor);
 
 			client_activate_surface(old, 0);
+			if (old_c->foreign_toplevel)
+				wlr_foreign_toplevel_handle_v1_set_activated(old_c->foreign_toplevel, 0);
 		}
 	}
 	printstatus();
@@ -1800,6 +1885,24 @@ mapnotify(struct wl_listener *listener, void *data)
 	} else {
 		applyrules(c);
 	}
+
+	/* Register with the foreign-toplevel manager so taskbars (e.g. dwlb's
+	 * window-tab strip) can list and control this window. */
+	c->foreign_toplevel = wlr_foreign_toplevel_handle_v1_create(foreign_toplevel_mgr);
+	wlr_foreign_toplevel_handle_v1_set_title(c->foreign_toplevel,
+			client_get_title(c) ? client_get_title(c) : "");
+	wlr_foreign_toplevel_handle_v1_set_app_id(c->foreign_toplevel,
+			client_get_appid(c) ? client_get_appid(c) : "");
+	/* Only enter the output if mapped on a visible tag; arrange() flips this
+	 * as tags change (see foreign_visible tracking there). */
+	if (c->mon && VISIBLEON(c, c->mon)) {
+		wlr_foreign_toplevel_handle_v1_output_enter(c->foreign_toplevel, c->mon->wlr_output);
+		c->foreign_visible = 1;
+	}
+	LISTEN(&c->foreign_toplevel->events.request_activate, &c->foreign_activate, foreigntoplevelactivate);
+	LISTEN(&c->foreign_toplevel->events.request_fullscreen, &c->foreign_fullscreen, foreigntoplevelfullscreen);
+	LISTEN(&c->foreign_toplevel->events.request_close, &c->foreign_close, foreigntoplevelclose);
+
 	printstatus();
 
 unset_fullscreen:
@@ -2093,6 +2196,220 @@ pointerfocus(Client *c, struct wlr_surface *surface, double sx, double sy,
 	wlr_seat_pointer_notify_motion(seat, time, sx, sy);
 }
 
+static const struct zdwl_ipc_manager_v2_interface dwl_manager_implementation = {
+	.release = dwl_ipc_manager_release,
+	.get_output = dwl_ipc_manager_get_output
+};
+static const struct zdwl_ipc_output_v2_interface dwl_output_implementation = {
+	.release = dwl_ipc_output_release,
+	.set_tags = dwl_ipc_output_set_tags,
+	.set_client_tags = dwl_ipc_output_set_client_tags,
+	.set_layout = dwl_ipc_output_set_layout
+};
+
+void
+dwl_ipc_manager_bind(struct wl_client *client, void *data, uint32_t version, uint32_t id)
+{
+	struct wl_resource *manager_resource;
+	unsigned int i;
+
+	manager_resource = wl_resource_create(client, &zdwl_ipc_manager_v2_interface, version, id);
+	if (!manager_resource) {
+		wl_client_post_no_memory(client);
+		return;
+	}
+	wl_resource_set_implementation(manager_resource, &dwl_manager_implementation, NULL, dwl_ipc_manager_destroy);
+
+	zdwl_ipc_manager_v2_send_tags(manager_resource, TAGCOUNT);
+
+	for (i = 0; i < LENGTH(layouts); i++)
+		zdwl_ipc_manager_v2_send_layout(manager_resource, layouts[i].symbol);
+}
+
+void
+dwl_ipc_manager_destroy(struct wl_resource *resource)
+{
+	/* No state to destroy. */
+}
+
+void
+dwl_ipc_manager_get_output(struct wl_client *client, struct wl_resource *resource, uint32_t id, struct wl_resource *output)
+{
+	DwlIpcOutput *ipc_output;
+	struct wlr_output *wlr_output;
+	Monitor *monitor;
+	struct wl_resource *output_resource;
+
+	output_resource = wl_resource_create(client, &zdwl_ipc_output_v2_interface, wl_resource_get_version(resource), id);
+	if (!output_resource)
+		return;
+
+	wlr_output = wlr_output_from_resource(output);
+	monitor = wlr_output ? wlr_output->data : NULL;
+	if (!monitor) {
+		/* Output is gone or not yet a dwl Monitor: hand back an inert resource. */
+		wl_resource_set_implementation(output_resource, &dwl_output_implementation, NULL, dwl_ipc_output_destroy);
+		return;
+	}
+
+	ipc_output = ecalloc(1, sizeof(*ipc_output));
+	ipc_output->resource = output_resource;
+	ipc_output->mon = monitor;
+	wl_resource_set_implementation(output_resource, &dwl_output_implementation, ipc_output, dwl_ipc_output_destroy);
+	wl_list_insert(&monitor->dwl_ipc_outputs, &ipc_output->link);
+	dwl_ipc_output_printstatus_to(ipc_output);
+}
+
+void
+dwl_ipc_manager_release(struct wl_client *client, struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+void
+dwl_ipc_output_destroy(struct wl_resource *resource)
+{
+	DwlIpcOutput *ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+	wl_list_remove(&ipc_output->link);
+	free(ipc_output);
+}
+
+void
+dwl_ipc_output_printstatus(Monitor *monitor)
+{
+	DwlIpcOutput *ipc_output;
+	wl_list_for_each(ipc_output, &monitor->dwl_ipc_outputs, link)
+		dwl_ipc_output_printstatus_to(ipc_output);
+}
+
+void
+dwl_ipc_output_printstatus_to(DwlIpcOutput *ipc_output)
+{
+	Monitor *monitor = ipc_output->mon;
+	Client *c, *focused;
+	int tagmask, state, numclients, focused_client, tag;
+	const char *title, *appid;
+
+	focused = focustop(monitor);
+	zdwl_ipc_output_v2_send_active(ipc_output->resource, monitor == selmon);
+
+	for (tag = 0; tag < TAGCOUNT; tag++) {
+		numclients = state = focused_client = 0;
+		tagmask = 1 << tag;
+		if ((tagmask & monitor->tagset[monitor->seltags]) != 0)
+			state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_ACTIVE;
+
+		wl_list_for_each(c, &clients, link) {
+			if (c->mon != monitor)
+				continue;
+			if (!(c->tags & tagmask))
+				continue;
+			numclients++;
+			if (c == focused)
+				focused_client = 1;
+			if (c->isurgent)
+				state |= ZDWL_IPC_OUTPUT_V2_TAG_STATE_URGENT;
+		}
+		zdwl_ipc_output_v2_send_tag(ipc_output->resource, tag, state, numclients, focused_client);
+	}
+
+	title = focused ? client_get_title(focused) : "";
+	appid = focused ? client_get_appid(focused) : "";
+
+	zdwl_ipc_output_v2_send_layout(ipc_output->resource,
+			(uint32_t)(monitor->lt[monitor->sellt] - layouts));
+	zdwl_ipc_output_v2_send_title(ipc_output->resource, title ? title : "");
+	zdwl_ipc_output_v2_send_appid(ipc_output->resource, appid ? appid : "");
+	zdwl_ipc_output_v2_send_layout_symbol(ipc_output->resource, monitor->ltsymbol);
+	if (wl_resource_get_version(ipc_output->resource) >= ZDWL_IPC_OUTPUT_V2_FULLSCREEN_SINCE_VERSION)
+		zdwl_ipc_output_v2_send_fullscreen(ipc_output->resource, focused ? focused->isfullscreen : 0);
+	if (wl_resource_get_version(ipc_output->resource) >= ZDWL_IPC_OUTPUT_V2_FLOATING_SINCE_VERSION)
+		zdwl_ipc_output_v2_send_floating(ipc_output->resource, focused ? focused->isfloating : 0);
+	zdwl_ipc_output_v2_send_frame(ipc_output->resource);
+}
+
+void
+dwl_ipc_output_release(struct wl_client *client, struct wl_resource *resource)
+{
+	wl_resource_destroy(resource);
+}
+
+void
+dwl_ipc_output_set_client_tags(struct wl_client *client, struct wl_resource *resource, uint32_t and_tags, uint32_t xor_tags)
+{
+	DwlIpcOutput *ipc_output;
+	Monitor *monitor;
+	Client *selected_client;
+	unsigned int newtags;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+
+	monitor = ipc_output->mon;
+	selected_client = focustop(monitor);
+	if (!selected_client)
+		return;
+
+	newtags = (selected_client->tags & and_tags) ^ xor_tags;
+	if (!newtags)
+		return;
+
+	selected_client->tags = newtags;
+	if (selmon == monitor)
+		focusclient(focustop(monitor), 1);
+	arrange(monitor);
+	printstatus();
+}
+
+void
+dwl_ipc_output_set_layout(struct wl_client *client, struct wl_resource *resource, uint32_t index)
+{
+	DwlIpcOutput *ipc_output;
+	Monitor *monitor;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+
+	monitor = ipc_output->mon;
+	if (index >= LENGTH(layouts))
+		return;
+	if (index != (uint32_t)(monitor->lt[monitor->sellt] - layouts))
+		monitor->sellt ^= 1;
+
+	monitor->lt[monitor->sellt] = &layouts[index];
+	arrange(monitor);
+	printstatus();
+}
+
+void
+dwl_ipc_output_set_tags(struct wl_client *client, struct wl_resource *resource, uint32_t tagmask, uint32_t toggle_tagset)
+{
+	DwlIpcOutput *ipc_output;
+	Monitor *monitor;
+	unsigned int newtags;
+
+	ipc_output = wl_resource_get_user_data(resource);
+	if (!ipc_output)
+		return;
+	monitor = ipc_output->mon;
+	newtags = tagmask & TAGMASK;
+
+	if (!newtags || newtags == monitor->tagset[monitor->seltags])
+		return;
+	if (toggle_tagset)
+		monitor->seltags ^= 1;
+
+	monitor->tagset[monitor->seltags] = newtags;
+	if (selmon == monitor)
+		focusclient(focustop(monitor), 1);
+	arrange(monitor);
+	printstatus();
+}
+
 void
 printstatus(void)
 {
@@ -2127,6 +2444,8 @@ printstatus(void)
 		printf("%s tags %"PRIu32" %"PRIu32" %"PRIu32" %"PRIu32"\n",
 			m->wlr_output->name, occ, m->tagset[m->seltags], sel, urg);
 		printf("%s layout %s\n", m->wlr_output->name, m->ltsymbol);
+
+		dwl_ipc_output_printstatus(m);
 	}
 	fflush(stdout);
 }
@@ -2361,6 +2680,8 @@ setfullscreen(Client *c, int fullscreen)
 		return;
 	c->bw = fullscreen ? 0 : borderpx;
 	client_set_fullscreen(c, fullscreen);
+	if (c->foreign_toplevel)
+		wlr_foreign_toplevel_handle_v1_set_fullscreen(c->foreign_toplevel, fullscreen);
 	wlr_scene_node_reparent(&c->scene->node, layers[c->isfullscreen
 			? LyrFS : c->isfloating ? LyrFloat : LyrTile]);
 
@@ -2424,6 +2745,13 @@ setmon(Client *c, Monitor *m, uint32_t newtags)
 		c->tags = newtags ? newtags : m->tagset[m->seltags]; /* assign tags of target monitor */
 		setfullscreen(c, c->isfullscreen); /* This will call arrange(c->mon) */
 		setfloating(c, c->isfloating);
+	}
+	/* arrange() won't revisit a client that left this monitor, so drop the
+	 * old output here; the enter on the new monitor is handled by arrange()
+	 * via the foreign_visible tracking once tags are assigned. */
+	if (c->foreign_toplevel && oldmon && c->foreign_visible) {
+		wlr_foreign_toplevel_handle_v1_output_leave(c->foreign_toplevel, oldmon->wlr_output);
+		c->foreign_visible = 0;
 	}
 	focusclient(focustop(selmon), 1);
 }
@@ -2544,6 +2872,10 @@ setup(void)
 
 	power_mgr = wlr_output_power_manager_v1_create(dpy);
 	wl_signal_add(&power_mgr->events.set_mode, &output_power_mgr_set_mode);
+
+	wl_global_create(dpy, &zdwl_ipc_manager_v2_interface, 2, NULL, dwl_ipc_manager_bind);
+
+	foreign_toplevel_mgr = wlr_foreign_toplevel_manager_v1_create(dpy);
 
 	/* Creates an output layout, which is a wlroots utility for working with an
 	 * arrangement of screens in a physical layout. */
@@ -2842,6 +3174,14 @@ unmapnotify(struct wl_listener *listener, void *data)
 		wl_list_remove(&c->flink);
 	}
 
+	if (c->foreign_toplevel) {
+		wl_list_remove(&c->foreign_activate.link);
+		wl_list_remove(&c->foreign_fullscreen.link);
+		wl_list_remove(&c->foreign_close.link);
+		wlr_foreign_toplevel_handle_v1_destroy(c->foreign_toplevel);
+		c->foreign_toplevel = NULL;
+	}
+
 	wlr_scene_node_destroy(&c->scene->node);
 	printstatus();
 	motionnotify(0, NULL, 0, 0, 0, 0);
@@ -2957,6 +3297,12 @@ void
 updatetitle(struct wl_listener *listener, void *data)
 {
 	Client *c = wl_container_of(listener, c, set_title);
+	if (c->foreign_toplevel) {
+		wlr_foreign_toplevel_handle_v1_set_title(c->foreign_toplevel,
+				client_get_title(c) ? client_get_title(c) : "");
+		wlr_foreign_toplevel_handle_v1_set_app_id(c->foreign_toplevel,
+				client_get_appid(c) ? client_get_appid(c) : "");
+	}
 	if (c == focustop(c->mon))
 		printstatus();
 }
